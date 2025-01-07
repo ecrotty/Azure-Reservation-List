@@ -5,14 +5,15 @@
 # License: BSD License
 #
 # .SYNOPSIS
-# Lists active and inactive Azure Reserved VM Instances for a given subscription and sends email alerts for expiring reservations.
+# Lists active and inactive Azure Reserved VM Instances for a given subscription, sends email alerts for expiring reservations, and optionally logs metrics to Azure Log Analytics.
 #
 # .DESCRIPTION
-# This script provides a simple way to list both active and expired Azure VM reservations.
-# It handles Azure authentication, retrieves reservation data, and sends email alerts for reservations nearing expiration.
+# This script provides a comprehensive solution for managing Azure VM reservations:
+# - Lists both active and expired Azure VM reservations
+# - Sends email alerts for reservations nearing expiration (180, 90, 30, 15, 10, 5, or 1 day(s) remaining)
+# - Optionally logs metrics to Azure Log Analytics when running with Managed Identity
 #
-# Email alerts are sent when reservations reach 180, 90, 30, 15, 10, 5, or 1 day(s) remaining.
-# The sender email address can be specified using the -SenderEmail parameter. If not provided, it defaults to noreply@yourdomain.com.
+# The script supports both interactive use and execution as an Azure Automation runbook.
 #
 # .NOTES
 # Required Modules: Az.Accounts, Az.Reservations, Microsoft.Graph.Authentication, Microsoft.Graph.Mail
@@ -27,26 +28,147 @@
 # The email address to use as the sender for alert emails. Defaults to noreply@yourdomain.com if not specified.
 #
 # .PARAMETER UseManagedIdentity
-# Switch to use managed identity for authentication when running in an Azure Automation runbook.
+# Switch to use managed identity for authentication. This should be used when running the script as an Azure Automation runbook.
+#
+# .PARAMETER LogAnalyticsWorkspaceId
+# The Workspace ID of the Log Analytics workspace for logging metrics. Only used when -UseManagedIdentity is specified.
+#
+# .PARAMETER LogAnalyticsSharedKey
+# The Shared Key of the Log Analytics workspace for logging metrics. Only used when -UseManagedIdentity is specified.
 #
 # .EXAMPLE
 # ./Azure-Reservation-List.ps1
+# Runs the script interactively, listing all reservations and sending email alerts.
+#
+# .EXAMPLE
 # ./Azure-Reservation-List.ps1 -ActiveOnly
+# Lists only active reservations and sends email alerts.
+#
+# .EXAMPLE
 # ./Azure-Reservation-List.ps1 -ExpiredOnly
+# Lists only expired reservations and sends email alerts.
+#
+# .EXAMPLE
 # ./Azure-Reservation-List.ps1 -SenderEmail "azure-alerts@mycompany.com"
-# ./Azure-Reservation-List.ps1 -UseManagedIdentity
-# ./Azure-Reservation-List.ps1 -ActiveOnly -UseManagedIdentity -SenderEmail "azure-alerts@mycompany.com"
+# Uses the specified email address as the sender for alert emails.
+#
+# .EXAMPLE
+# ./Azure-Reservation-List.ps1 -UseManagedIdentity -LogAnalyticsWorkspaceId "workspace-id" -LogAnalyticsSharedKey "workspace-key"
+# Runs the script using Managed Identity (for Azure Automation) and logs metrics to the specified Log Analytics workspace.
+#
+# .EXAMPLE
+# ./Azure-Reservation-List.ps1 -ActiveOnly -UseManagedIdentity -LogAnalyticsWorkspaceId "workspace-id" -LogAnalyticsSharedKey "workspace-key" -SenderEmail "azure-alerts@mycompany.com"
+# Combines multiple parameters: lists only active reservations, uses Managed Identity, logs to Log Analytics, and specifies a sender email.
 
 param (
     [switch]$ActiveOnly,
     [switch]$ExpiredOnly,
     [string]$SenderEmail = "noreply@yourdomain.com",
-    [switch]$UseManagedIdentity
+    [switch]$UseManagedIdentity,
+    [string]$LogAnalyticsWorkspaceId,
+    [string]$LogAnalyticsSharedKey,
+    [switch]$Help
 )
+
+if ($Help) {
+    Write-Host "Azure-Reservation-List.ps1 - Lists Azure Reserved VM Instances"
+    Write-Host ""
+    Write-Host "Options:"
+    Write-Host "  -ActiveOnly                 Display only active reservations"
+    Write-Host "  -ExpiredOnly                Display only expired reservations"
+    Write-Host "  -SenderEmail <email>        Specify the sender email for alerts (default: noreply@yourdomain.com)"
+    Write-Host "  -UseManagedIdentity         Use managed identity for authentication"
+    Write-Host "  -LogAnalyticsWorkspaceId    Specify the Log Analytics Workspace ID"
+    Write-Host "  -LogAnalyticsSharedKey      Specify the Log Analytics Shared Key"
+    Write-Host "  -Help                       Display this help message"
+    exit 0
+}
 
 # Set strict mode and error action preference
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# Function to get reservations
+function Get-AzureReservations {
+    Write-Host "Retrieving Azure reservations..."
+    $allReservations = @(Get-AzReservation)
+    
+    if ($allReservations.Count -eq 0) {
+        Write-Host "No reservations found." -ForegroundColor Yellow
+        return $null
+    }
+    
+    $currentDate = Get-Date
+    $expiredReservations = @($allReservations | Where-Object { $_.ExpiryDate -lt $currentDate })
+    $activeReservations = @($allReservations | Where-Object { $_.ExpiryDate -ge $currentDate })
+    
+    $expiredCount = $expiredReservations.Count
+    $activeCount = $activeReservations.Count
+    
+    Write-Host "Found $activeCount active reservation(s)." -ForegroundColor Green
+    Write-Host "Found $expiredCount expired reservation(s)." -ForegroundColor Yellow
+    
+    return @{
+        Active = $activeReservations
+        Expired = $expiredReservations
+    }
+}
+
+# Function to safely get count
+function Get-SafeCount($array) {
+    if ($null -eq $array) { return 0 }
+    if ($array -is [array]) { return $array.Count }
+    return 1  # If it's a single object, count as 1
+}
+
+# Check if Log Analytics settings are provided when using Managed Identity
+if ($UseManagedIdentity -and (-not $LogAnalyticsWorkspaceId -or -not $LogAnalyticsSharedKey)) {
+    Write-Warning "Log Analytics Workspace ID and Shared Key are required when using Managed Identity for full functionality. Metrics will not be sent to Log Analytics."
+}
+
+# Function to send data to Log Analytics
+function Send-LogAnalyticsData {
+    param (
+        [string]$customerId,
+        [string]$sharedKey,
+        [object]$body
+    )
+
+    if (-not $customerId -or -not $sharedKey) {
+        Write-Warning "Log Analytics Workspace ID or Shared Key not provided. Skipping metric submission."
+        return
+    }
+
+    $method = "POST"
+    $contentType = "application/json"
+    $resource = "/api/logs"
+    $rfc1123date = [DateTime]::UtcNow.ToString("r")
+    $contentLength = $body.Length
+    $signature = Build-Signature `
+        -customerId $customerId `
+        -sharedKey $sharedKey `
+        -date $rfc1123date `
+        -contentLength $contentLength `
+        -method $method `
+        -contentType $contentType `
+        -resource $resource
+
+    $uri = "https://" + $customerId + ".ods.opinsights.azure.com" + $resource + "?api-version=2016-04-01"
+    $headers = @{
+        "Authorization" = $signature;
+        "Log-Type" = "AzureReservationMetrics";
+        "x-ms-date" = $rfc1123date;
+        "time-generated-field" = "";
+    }
+
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Method $method -ContentType $contentType -Headers $headers -Body $body -UseBasicParsing
+        Write-Host "Data successfully sent to Log Analytics" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Failed to send data to Log Analytics: $_"
+    }
+}
 
 # Function to install and import required modules
 function Initialize-RequiredModules {
@@ -142,26 +264,6 @@ function Connect-ToAzure {
     }
 }
 
-# Function to get reservations
-function Get-AzureReservations {
-    Write-Host "Retrieving Azure reservations..."
-    $allReservations = @(Get-AzReservation)
-    
-    $expiredReservations = @($allReservations | Where-Object { $_.ExpiryDate -lt (Get-Date) })
-    $activeReservations = @($allReservations | Where-Object { $_.ExpiryDate -ge (Get-Date) })
-    
-    $expiredCount = ($expiredReservations | Measure-Object).Count
-    $activeCount = ($activeReservations | Measure-Object).Count
-    
-    Write-Host "Found $activeCount active reservation(s)." -ForegroundColor Green
-    Write-Host "Found $expiredCount expired reservation(s)." -ForegroundColor Yellow
-    
-    return @{
-        Active = $activeReservations
-        Expired = $expiredReservations
-    }
-}
-
 # Function to display reservations
 function Display-Reservations {
     param (
@@ -173,14 +275,16 @@ function Display-Reservations {
     Write-Host "`n$status Reservations:" -ForegroundColor Cyan
     Write-Host "------------------------" -ForegroundColor Cyan
 
-    if ($reservations.Count -eq 0) {
+    if ((Get-SafeCount $reservations) -eq 0) {
         Write-Host "No $status reservations found."
     } else {
         foreach ($reservation in $reservations) {
             $daysRemaining = ($reservation.ExpiryDate - (Get-Date)).Days
-            $warningColor = if ($daysRemaining -le 30) {
+            
+            $warningColor = if ($daysRemaining -le 0) {
+                "Red"
+            } elseif ($daysRemaining -le 30) {
                 switch ($daysRemaining) {
-                    {$_ -le 1} { "Red" }
                     {$_ -le 5} { "DarkRed" }
                     {$_ -le 10} { "Yellow" }
                     {$_ -le 15} { "DarkYellow" }
@@ -262,35 +366,59 @@ try {
     # Install and import required modules
     Initialize-RequiredModules
     
-    # Ensure Azure connection
-    Connect-ToAzure
-    
     # Connect to Microsoft Graph
     Connect-ToMicrosoftGraph
+    
+    # Ensure Azure connection
+    Connect-ToAzure
     
     # Get reservations
     $reservations = Get-AzureReservations
     
-    # If SenderEmail is not provided and using managed identity, try to get it from the context
-    if ($UseManagedIdentity -and [string]::IsNullOrEmpty($SenderEmail)) {
-        $context = Get-AzContext
-        $SenderEmail = $context.Account.Id
-        Write-Host "Using $SenderEmail as the sender email address"
+    if ($null -eq $reservations) {
+        Write-Host "No reservations found. Exiting script." -ForegroundColor Yellow
+        exit 0
     }
-    
+
+    # Initialize counters for Azure Monitor
+    $expiringReservationsCount = 0
+    $totalActiveReservations = Get-SafeCount $reservations.Active
+    $totalExpiredReservations = Get-SafeCount $reservations.Expired
+
     # Display reservations based on parameters
     if ($ActiveOnly) {
         Display-Reservations -reservations $reservations.Active -status "Active" -senderEmail $SenderEmail
+        $expiringReservationsCount = @($reservations.Active | Where-Object { ($_.ExpiryDate - (Get-Date)).Days -in 1..180 }).Count
     } elseif ($ExpiredOnly) {
         Display-Reservations -reservations $reservations.Expired -status "Expired" -senderEmail $SenderEmail
     } else {
         Display-Reservations -reservations $reservations.Active -status "Active" -senderEmail $SenderEmail
         Display-Reservations -reservations $reservations.Expired -status "Expired" -senderEmail $SenderEmail
+        $expiringReservationsCount = @($reservations.Active | Where-Object { ($_.ExpiryDate - (Get-Date)).Days -in 1..180 }).Count
     }
-    
+
+    # Send metrics to Log Analytics only if using Managed Identity and LAW settings are provided
+    if ($UseManagedIdentity -and $LogAnalyticsWorkspaceId -and $LogAnalyticsSharedKey) {
+        $metrics = @{
+            "TotalActiveReservations" = $totalActiveReservations
+            "TotalExpiredReservations" = $totalExpiredReservations
+            "ExpiringReservations" = $expiringReservationsCount
+            "ScriptExecutionSuccess" = 1
+        }
+        Send-LogAnalyticsData -customerId $LogAnalyticsWorkspaceId -sharedKey $LogAnalyticsSharedKey -body ($metrics | ConvertTo-Json)
+    }
+
+    Write-Host "Script execution completed successfully." -ForegroundColor Green
 } catch {
     Write-Host "An error occurred: $_" -ForegroundColor Red
     Write-Host "Stack Trace: $($_.ScriptStackTrace)" -ForegroundColor Red
+    # Send failure metric to Log Analytics only if using Managed Identity and LAW settings are provided
+    if ($UseManagedIdentity -and $LogAnalyticsWorkspaceId -and $LogAnalyticsSharedKey) {
+        $metrics = @{
+            "ScriptExecutionSuccess" = 0
+        }
+        Send-LogAnalyticsData -customerId $LogAnalyticsWorkspaceId -sharedKey $LogAnalyticsSharedKey -body ($metrics | ConvertTo-Json)
+    }
     exit 1
 } finally {
     # Disconnect from Microsoft Graph
