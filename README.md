@@ -8,6 +8,7 @@ This PowerShell script provides a simple way to list both active and expired Azu
 - Sends email alerts for expiring reservations
 - Supports filtering for active or expired reservations only
 - Customizable sender email address for alerts
+- Supports running in Azure Automation runbooks using managed identity
 
 ## Prerequisites
 
@@ -23,7 +24,7 @@ These modules will be automatically installed if not present.
 ## Usage
 
 ```powershell
-./Azure-Reservation-List.ps1 [[-ActiveOnly] | [-ExpiredOnly]] [-SenderEmail <email_address>]
+./Azure-Reservation-List.ps1 [[-ActiveOnly] | [-ExpiredOnly]] [-SenderEmail <email_address>] [-UseManagedIdentity]
 ```
 
 ### Parameters
@@ -31,6 +32,7 @@ These modules will be automatically installed if not present.
 - `-ActiveOnly`: Switch to display only active reservations.
 - `-ExpiredOnly`: Switch to display only expired reservations.
 - `-SenderEmail`: The email address to use as the sender for alert emails. Defaults to noreply@yourdomain.com if not specified.
+- `-UseManagedIdentity`: Switch to use managed identity for authentication when running in an Azure Automation runbook.
 
 ### Examples
 
@@ -52,6 +54,16 @@ These modules will be automatically installed if not present.
 4. Use a custom sender email for alerts:
    ```powershell
    ./Azure-Reservation-List.ps1 -SenderEmail "azure-alerts@mycompany.com"
+   ```
+
+5. Run using managed identity in an Azure Automation runbook:
+   ```powershell
+   ./Azure-Reservation-List.ps1 -UseManagedIdentity
+   ```
+
+6. Combine multiple parameters:
+   ```powershell
+   ./Azure-Reservation-List.ps1 -ActiveOnly -UseManagedIdentity -SenderEmail "azure-alerts@mycompany.com"
    ```
 
 ## Email Alerts

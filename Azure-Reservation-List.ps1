@@ -26,16 +26,22 @@
 # .PARAMETER SenderEmail
 # The email address to use as the sender for alert emails. Defaults to noreply@yourdomain.com if not specified.
 #
+# .PARAMETER UseManagedIdentity
+# Switch to use managed identity for authentication when running in an Azure Automation runbook.
+#
 # .EXAMPLE
 # ./Azure-Reservation-List.ps1
 # ./Azure-Reservation-List.ps1 -ActiveOnly
 # ./Azure-Reservation-List.ps1 -ExpiredOnly
 # ./Azure-Reservation-List.ps1 -SenderEmail "azure-alerts@mycompany.com"
+# ./Azure-Reservation-List.ps1 -UseManagedIdentity
+# ./Azure-Reservation-List.ps1 -ActiveOnly -UseManagedIdentity -SenderEmail "azure-alerts@mycompany.com"
 
 param (
     [switch]$ActiveOnly,
     [switch]$ExpiredOnly,
-    [string]$SenderEmail = "noreply@yourdomain.com"
+    [string]$SenderEmail = "noreply@yourdomain.com",
+    [switch]$UseManagedIdentity
 )
 
 # Set strict mode and error action preference
@@ -68,7 +74,11 @@ function Connect-ToMicrosoftGraph {
         $graphConnection = Get-MgContext
         if (-not $graphConnection) {
             Write-Host "No Microsoft Graph context found. Initiating login..."
-            Connect-MgGraph -Scopes "Mail.Send"
+            if ($UseManagedIdentity) {
+                Connect-MgGraph -Identity
+            } else {
+                Connect-MgGraph -Scopes "Mail.Send"
+            }
             Write-Host "Connected to Microsoft Graph" -ForegroundColor Green
         } else {
             Write-Host "Already connected to Microsoft Graph" -ForegroundColor Green
@@ -86,34 +96,42 @@ function Connect-ToAzure {
         $context = Get-AzContext
         if (-not $context) {
             Write-Host "No Azure context found. Initiating login..."
-            Connect-AzAccount
+            if ($UseManagedIdentity) {
+                Connect-AzAccount -Identity
+            } else {
+                Connect-AzAccount
+            }
         } else {
             Write-Host "Already connected to Azure" -ForegroundColor Green
         }
         
-        $subscriptions = @(Get-AzSubscription)
-        if ($subscriptions.Count -eq 0) {
-            throw "No subscriptions found for the current account"
-        }
-        
-        if ($subscriptions.Count -eq 1) {
-            Write-Host "Only one subscription available. Using: $($subscriptions[0].Name)"
-            $selectedSubscription = $subscriptions[0]
+        if (-not $UseManagedIdentity) {
+            $subscriptions = @(Get-AzSubscription)
+            if ($subscriptions.Count -eq 0) {
+                throw "No subscriptions found for the current account"
+            }
+            
+            if ($subscriptions.Count -eq 1) {
+                Write-Host "Only one subscription available. Using: $($subscriptions[0].Name)"
+                $selectedSubscription = $subscriptions[0]
+            } else {
+                Write-Host "Available subscriptions:"
+                for ($i = 0; $i -lt $subscriptions.Count; $i++) {
+                    Write-Host "$($i + 1). $($subscriptions[$i].Name)"
+                }
+                
+                $selection = Read-Host "Enter the number of the subscription you want to use"
+                $selectedSubscription = $subscriptions[$selection - 1]
+                
+                if (-not $selectedSubscription) {
+                    throw "Invalid selection"
+                }
+            }
+            
+            $context = Set-AzContext -Subscription $selectedSubscription.Id
         } else {
-            Write-Host "Available subscriptions:"
-            for ($i = 0; $i -lt $subscriptions.Count; $i++) {
-                Write-Host "$($i + 1). $($subscriptions[$i].Name)"
-            }
-            
-            $selection = Read-Host "Enter the number of the subscription you want to use"
-            $selectedSubscription = $subscriptions[$selection - 1]
-            
-            if (-not $selectedSubscription) {
-                throw "Invalid selection"
-            }
+            $context = Get-AzContext
         }
-        
-        $context = Set-AzContext -Subscription $selectedSubscription.Id
         
         Write-Host "Connected to Azure subscription: $($context.Subscription.Name)"
         return $context
@@ -225,7 +243,11 @@ function Send-ExpirationNotification {
     }
 
     try {
-        Send-MgUserMail -UserId $senderEmail -BodyParameter $params
+        if ($UseManagedIdentity) {
+            Send-MgUserMail -BodyParameter $params
+        } else {
+            Send-MgUserMail -UserId $senderEmail -BodyParameter $params
+        }
         Write-Host "Email notification sent for reservation $reservationId" -ForegroundColor Green
     }
     catch {
@@ -248,6 +270,13 @@ try {
     
     # Get reservations
     $reservations = Get-AzureReservations
+    
+    # If SenderEmail is not provided and using managed identity, try to get it from the context
+    if ($UseManagedIdentity -and [string]::IsNullOrEmpty($SenderEmail)) {
+        $context = Get-AzContext
+        $SenderEmail = $context.Account.Id
+        Write-Host "Using $SenderEmail as the sender email address"
+    }
     
     # Display reservations based on parameters
     if ($ActiveOnly) {
